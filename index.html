@@ -52,7 +52,7 @@ button:disabled{opacity:.6;cursor:default}
   var VOLTAS = 310000, CHAVE = "lf-haddad-previa-senha";
   var f = document.getElementById("f"), campo = document.getElementById("senha"), botao = document.getElementById("b");
   var msg = document.getElementById("m"), barra = document.getElementById("p"), lembrar = document.getElementById("lembrar");
-  var conteudo = null;
+  var conteudo = null, chaveAtual = null;
   // celular (toque e lado menor até 600 px) recebe a página do celular; ?celular=0 ou =1 força
   var q = location.search, CEL = /celular=1/.test(q) || (!/celular=0/.test(q) && !!window.matchMedia &&
     matchMedia("(pointer: coarse)").matches && Math.min(screen.width, screen.height) <= 600);
@@ -86,6 +86,7 @@ button:disabled{opacity:.6;cursor:default}
     var visao = new DataView(claro), tam = visao.getUint32(0), dec = new TextDecoder();
     var indice = JSON.parse(dec.decode(new Uint8Array(claro, 4, tam))), base = 4 + tam, mapa = {}, textos = [], pagina = "";
     indice.forEach(function (a) {
+      if (a.x) { mapa[a.p] = "previa-video/" + a.x; return; }   // vídeo à parte: vem só quando a página pedir
       var bytes = new Uint8Array(claro, base + a.o, a.n);
       if (a.p === "pagina.html") { pagina = dec.decode(bytes); }
       else if (/\.(css|js)$/.test(a.p)) { textos.push([a, dec.decode(bytes)]); }
@@ -94,6 +95,36 @@ button:disabled{opacity:.6;cursor:default}
     // folhas de estilo e scripts depois das fotos, fontes e vídeos: eles citam esses arquivos
     textos.forEach(function (x) { mapa[x[0].p] = URL.createObjectURL(new Blob([trocar(x[1], mapa)], { type: x[0].t })); });
     return trocar(pagina, mapa);
+  }
+  // vídeo à parte (VIDEO_A_PARTE): a página troca a fonte do vídeo para "previa-video/v-….bin" e chama load(); o load() e o play() daqui
+  // baixam esse arquivo, decifram com a mesma chave, põem o endereço blob: na fonte e só então seguem. A página abre sem esperar o vídeo.
+  function armaVideo() {
+    var guardados = {}, M = HTMLMediaElement.prototype, carregar = M.load, tocar = M.play;
+    window.__previaVideo = function (nome) {
+      if (!guardados[nome]) {
+        guardados[nome] = fetch(nome).then(function (r) { if (!r.ok) { throw new Error("vídeo " + r.status); } return r.arrayBuffer(); })
+          .then(function (buf) { var b = new Uint8Array(buf); return crypto.subtle.decrypt({ name: "AES-GCM", iv: b.slice(0, 12) }, chaveAtual, b.slice(12)); })
+          .then(function (claro) { return URL.createObjectURL(new Blob([claro], { type: "video/mp4" })); });
+        guardados[nome].catch(function () { delete guardados[nome]; });
+      }
+      return guardados[nome];
+    };
+    M.load = function () {
+      var v = this, s = v.querySelector("source[src]"), u = s && s.getAttribute("src"), m = u && /^previa-video\/(v-[\w.-]+\.bin)$/.exec(u);
+      if (!m) { return carregar.call(v); }
+      var p = window.__previaVideo(m[1]).then(function (url) {
+        if (s.getAttribute("src") === u) { s.setAttribute("src", url); }
+        if (v.__previa === p) { v.__previa = null; }
+        carregar.call(v);
+      });
+      v.__previa = p;
+      p.catch(function () { if (v.__previa === p) { v.__previa = null; } });
+    };
+    M.play = function () {
+      var v = this;
+      if (v.__previa) { return v.__previa.then(function () { return tocar.call(v); }); }
+      return tocar.call(v);
+    };
   }
   function abrir(senha) {
     botao.disabled = true; msg.className = "msg"; msg.textContent = "Abrindo a prévia…";
@@ -104,10 +135,11 @@ button:disabled{opacity:.6;cursor:default}
       return crypto.subtle.importKey("raw", new TextEncoder().encode(senha), "PBKDF2", false, ["deriveKey"]).then(function (k) {
         return crypto.subtle.deriveKey({ name: "PBKDF2", salt: sal, iterations: VOLTAS, hash: "SHA-256" }, k,
           { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
-      }).then(function (chave) { return crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, chave, dados); });
+      }).then(function (chave) { chaveAtual = chave; return crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, chave, dados); });
     }).then(function (claro) {
       try { if (lembrar.checked) { localStorage.setItem(CHAVE, senha); } } catch (e) { /* navegador sem armazenamento */ }
       var html = montar(claro);
+      armaVideo();
       document.open(); document.write(html); document.close();
     }).catch(function () {
       botao.disabled = false; msg.className = "msg erro";
