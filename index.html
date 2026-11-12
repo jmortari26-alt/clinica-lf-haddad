@@ -49,45 +49,113 @@ button:disabled{opacity:.6;cursor:default}
 </main>
 <script>
 (function () {
-  var VOLTAS = 310000, CHAVE = "lf-haddad-previa-senha";
+  var VOLTAS = 310000, CHAVE = "lf-haddad-previa-senha", ARQ = {"pc":{"base":{"f":"b-pc-6b1d8b4914.bin","n":281300},"basez":{"f":"bz-pc-08193d029a.bin","n":124598},"resto":[{"f":"r1-pc-0897566755.bin","n":343078},{"f":"r2-pc-5eb0da5216.bin","n":469952},{"f":"r3-pc-2f37b93e33.bin","n":288655}]},"capa-cel":{"f":"capa-cel-8ed0569534.bin","n":121186},"capa-pc":{"f":"capa-pc-28e7313e2c.bin","n":170263},"media":"(max-width:760px), (max-aspect-ratio:3/2)","cel":{"base":{"f":"b-cel-d3d47fdf69.bin","n":280256},"basez":{"f":"bz-cel-68cf5ba87d.bin","n":124586},"resto":[{"f":"r1-cel-d760fdb93d.bin","n":323246},{"f":"r2-cel-5ac9e7a7e7.bin","n":627343},{"f":"r3-cel-b459303fb3.bin","n":558704},{"f":"r4-cel-2f37b93e33.bin","n":288655}]}};
+  var SAL = new Uint8Array("d6fa6facaedfb4c9c4c71274a48a2fb3".match(/../g).map(function (h) { return parseInt(h, 16); }));
   var f = document.getElementById("f"), campo = document.getElementById("senha"), botao = document.getElementById("b");
   var msg = document.getElementById("m"), barra = document.getElementById("p"), lembrar = document.getElementById("lembrar");
-  var conteudo = null, chaveAtual = null;
+  var chaveAtual = null, dec = new TextDecoder();
   // celular (toque e lado menor até 600 px) recebe a página do celular; ?celular=0 ou =1 força
   var q = location.search, CEL = /celular=1/.test(q) || (!/celular=0/.test(q) && !!window.matchMedia &&
     matchMedia("(pointer: coarse)").matches && Math.min(screen.width, screen.height) <= 600);
-  // baixa o pacote cifrado enquanto a pessoa digita a senha
-  function baixar() {
-    if (conteudo) { return conteudo; }
-    barra.parentNode.classList.add("ativa");
-    conteudo = fetch(CEL ? "pacote-celular.bin" : "pacote.bin").then(function (r) {
-      if (!r.ok) { throw new Error("pacote " + r.status); }
-      if (!r.body) { return r.arrayBuffer(); }
-      var total = +r.headers.get("content-length") || 0, lido = 0, partes = [], leitor = r.body.getReader();
+  var PAG = ARQ[CEL ? "cel" : "pc"];
+  // DUAS_ETAPAS: primeiro a página e as fotos da capa no formato que a tela pede (o mesmo teste do <picture> da página); o resto das fotos
+  // e a capa do outro formato vêm logo depois, em segundo plano
+  var capaCel = !!(ARQ.media && window.matchMedia && matchMedia(ARQ.media).matches);
+  // TEXTO_COMPRIMIDO: com o DecompressionStream, o primeiro pacote com a página, os estilos e os scripts comprimidos
+  var ABRE_GZIP = typeof DecompressionStream === "function" && typeof Response === "function";
+  var PRIMEIRA = [ABRE_GZIP && PAG.basez || PAG.base].concat(ARQ.media ? [ARQ[capaCel ? "capa-cel" : "capa-pc"]] : []);
+  var DEPOIS = ARQ.media ? PAG.resto.concat([ARQ[capaCel ? "capa-pc" : "capa-cel"]]) : [];
+  var baixados = {}, lido = 0, total = 0, etapa1 = null;
+  PRIMEIRA.forEach(function (a) { total += a.n; });
+  function baixa(a, conta) {
+    if (baixados[a.f]) { return baixados[a.f]; }
+    var p = fetch(a.f).then(function (r) {
+      if (!r.ok) { throw new Error(a.f + " " + r.status); }
+      if (!conta || !r.body) { return r.arrayBuffer(); }
+      var partes = [], leitor = r.body.getReader();
       function passo() {
         return leitor.read().then(function (x) {
           if (x.done) { return new Blob(partes).arrayBuffer(); }
           partes.push(x.value); lido += x.value.length;
-          if (total) { barra.style.width = Math.min(100, lido / total * 100).toFixed(0) + "%"; }
+          barra.style.width = Math.min(100, lido / total * 100).toFixed(0) + "%";
           return passo();
         });
       }
       return passo();
     });
-    conteudo.catch(function () { conteudo = null; });
-    return conteudo;
+    baixados[a.f] = p;
+    p.catch(function () { if (baixados[a.f] === p) { delete baixados[a.f]; } });
+    return p;
   }
+  // a primeira etapa baixa enquanto a pessoa digita a senha; a segunda vem logo depois, em fila, um pacote atrás do outro, na ordem da página
+  function baixar() {
+    if (etapa1) { return etapa1; }
+    barra.parentNode.classList.add("ativa");
+    var p = etapa1 = Promise.all(PRIMEIRA.map(function (a) { return baixa(a, true); }));
+    p.then(function () { fila(); }, function () { if (etapa1 === p) { etapa1 = null; lido = 0; } });
+    return p;
+  }
+  function tenta(a, n) {
+    return baixa(a, false).catch(function (e) {
+      if (n >= 5) { throw e; }
+      return new Promise(function (ok) { setTimeout(ok, 1500 * (n + 1)); }).then(function () { return tenta(a, n + 1); });
+    });
+  }
+  var pedidos = null;
+  function fila() {
+    if (pedidos) { return pedidos; }
+    var anterior = Promise.resolve();
+    pedidos = DEPOIS.map(function (a) {
+      var p = anterior.then(function () { return tenta(a, 0); });
+      anterior = p.catch(function () { /* o próximo segue */ });
+      return p;
+    });
+    return pedidos;
+  }
+  // CHAVE_NO_PORTAO: o sal já está aqui, então a chave da senha (310 mil voltas) é calculada enquanto a primeira etapa baixa
+  var chaves = {};
+  function chaveDe(senha) {
+    if (!chaves[senha]) {
+      chaves[senha] = crypto.subtle.importKey("raw", new TextEncoder().encode(senha), "PBKDF2", false, ["deriveKey"]).then(function (k) {
+        return crypto.subtle.deriveKey({ name: "PBKDF2", salt: SAL, iterations: VOLTAS, hash: "SHA-256" }, k,
+          { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+      });
+      chaves[senha].catch(function () { delete chaves[senha]; });
+    }
+    return chaves[senha];
+  }
+  function decifra(buf, chave) { var b = new Uint8Array(buf); return crypto.subtle.decrypt({ name: "AES-GCM", iv: b.subarray(0, 12) }, chave, b.subarray(12)); }
+  function abre(claro) {                  // 4 bytes com o tamanho do índice, o índice em JSON e os arquivos em sequência
+    var tam = new DataView(claro).getUint32(0);
+    return { indice: JSON.parse(dec.decode(new Uint8Array(claro, 4, tam))), base: 4 + tam, claro: claro };
+  }
+  function endereco(pac, a) { return URL.createObjectURL(new Blob([new Uint8Array(pac.claro, pac.base + a.o, a.n)], { type: a.t })); }
   // troca cada caminho citado (css/, js/, fontes/, img/, video/, com ou sem ../ na frente) pelo endereço blob: do arquivo
-  var CITA = /(^|[^\w\/.-])(?:\.\.\/)?((?:css|js|fontes|img|video)\/[\w.\/-]+?\.(?:css|js|woff2|webp|png|jpg|mp4))/g;
+  var CITA = /(^|[^\w\/.-])(?:\.\.\/)?((?:css|js|fontes|img|video)\/[\w.\/-]+?\.(?:css|js|woff2|webp|png|jpg|mp4|avif))/g;
   function trocar(texto, mapa) {
     return texto.replace(CITA, function (tudo, antes, caminho) { return mapa[caminho] ? antes + mapa[caminho] : tudo; });
   }
-  function montar(claro) {
-    var visao = new DataView(claro), tam = visao.getUint32(0), dec = new TextDecoder();
-    var indice = JSON.parse(dec.decode(new Uint8Array(claro, 4, tam))), base = 4 + tam, mapa = {}, textos = [], pagina = "";
-    indice.forEach(function (a) {
+  // foto que ainda não chegou: uma imagem transparente do mesmo tamanho da foto (nada muda de lugar), marcada com o número dela
+  var ESPERA = [], PRONTO = {}, MARCA = /data:image\/svg\+xml,[\w%.]*#previa(\d+)/g, ATRIB = ["src", "srcset", "poster", "href"];
+  function marcador(a) {
+    ESPERA.push(a.p);
+    return "data:image/svg+xml," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="' + a.w + '" height="' + a.h + '"/>') +
+      "#previa" + (ESPERA.length - 1);
+  }
+  function abreTextos(pac) {             // TEXTO_COMPRIMIDO: abre o gzip de cada texto marcado (z) do primeiro pacote
+    var abertos = {};
+    return Promise.all(pac.indice.filter(function (a) { return a.z; }).map(function (a) {
+      var fluxo = new Blob([new Uint8Array(pac.claro, pac.base + a.o, a.n)]).stream().pipeThrough(new DecompressionStream("gzip"));
+      return new Response(fluxo).arrayBuffer().then(function (b) { abertos[a.p] = new Uint8Array(b); });
+    })).then(function () { return abertos; });
+  }
+  function montar(pacs, abertos) {
+    var base = pacs[0], mapa = {}, textos = [], pagina = "";
+    pacs.slice(1).forEach(function (pac) { pac.indice.forEach(function (a) { mapa[a.p] = endereco(pac, a); }); });
+    base.indice.forEach(function (a) {
       if (a.x) { mapa[a.p] = "previa-video/" + a.x; return; }   // vídeo à parte: vem só quando a página pedir
-      var bytes = new Uint8Array(claro, base + a.o, a.n);
+      if (a.g) { if (!mapa[a.p]) { mapa[a.p] = marcador(a); } return; }   // foto da segunda etapa
+      var bytes = abertos[a.p] || new Uint8Array(base.claro, base.base + a.o, a.n);
       if (a.p === "pagina.html") { pagina = dec.decode(bytes); }
       else if (/\.(css|js)$/.test(a.p)) { textos.push([a, dec.decode(bytes)]); }
       else { mapa[a.p] = URL.createObjectURL(new Blob([bytes], { type: a.t })); }
@@ -96,6 +164,41 @@ button:disabled{opacity:.6;cursor:default}
     textos.forEach(function (x) { mapa[x[0].p] = URL.createObjectURL(new Blob([trocar(x[1], mapa)], { type: x[0].t })); });
     return trocar(pagina, mapa);
   }
+  // a segunda etapa chega: cada marcador vira o endereço da foto; marcador que um script puser de novo é trocado na hora
+  function limpa(el) {
+    for (var i = 0; i < ATRIB.length; i++) {
+      var v = el.getAttribute(ATRIB[i]);
+      if (v && v.indexOf("#previa") >= 0) {
+        var w = v.replace(MARCA, function (t, n) { return PRONTO[ESPERA[n]] || t; });
+        if (w !== v) { el.setAttribute(ATRIB[i], w); }
+      }
+    }
+  }
+  function varre(raiz) {
+    if (raiz.getAttribute) { limpa(raiz); }
+    var l = raiz.querySelectorAll ? raiz.querySelectorAll("[src],[srcset],[poster],[href]") : [];
+    for (var i = 0; i < l.length; i++) { limpa(l[i]); }
+  }
+  var vigia = null;
+  function chegou(pac) {
+    pac.indice.forEach(function (a) { PRONTO[a.p] = endereco(pac, a); });
+    varre(document.documentElement);
+    if (!vigia && window.MutationObserver) {
+      vigia = new MutationObserver(function (ms) {
+        ms.forEach(function (m) {
+          if (m.type === "attributes") { limpa(m.target); return; }
+          for (var i = 0; i < m.addedNodes.length; i++) { if (m.addedNodes[i].nodeType === 1) { varre(m.addedNodes[i]); } }
+        });
+      });
+      vigia.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ATRIB });
+    }
+    window.__previaEtapa2 = (window.__previaEtapa2 || 0) + 1;
+  }
+  function segunda(chave) {
+    fila().forEach(function (p) {
+      p.then(function (buf) { return decifra(buf, chave); }).then(function (claro) { chegou(abre(claro)); }, function () { /* fica o marcador */ });
+    });
+  }
   // vídeo à parte (VIDEO_A_PARTE): a página troca a fonte do vídeo para "previa-video/v-….bin" e chama load(); o load() e o play() daqui
   // baixam esse arquivo, decifram com a mesma chave, põem o endereço blob: na fonte e só então seguem. A página abre sem esperar o vídeo.
   function armaVideo() {
@@ -103,7 +206,7 @@ button:disabled{opacity:.6;cursor:default}
     window.__previaVideo = function (nome) {
       if (!guardados[nome]) {
         guardados[nome] = fetch(nome).then(function (r) { if (!r.ok) { throw new Error("vídeo " + r.status); } return r.arrayBuffer(); })
-          .then(function (buf) { var b = new Uint8Array(buf); return crypto.subtle.decrypt({ name: "AES-GCM", iv: b.slice(0, 12) }, chaveAtual, b.slice(12)); })
+          .then(function (buf) { return decifra(buf, chaveAtual); })
           .then(function (claro) { return URL.createObjectURL(new Blob([claro], { type: "video/mp4" })); });
         guardados[nome].catch(function () { delete guardados[nome]; });
       }
@@ -128,19 +231,19 @@ button:disabled{opacity:.6;cursor:default}
   }
   function abrir(senha) {
     botao.disabled = true; msg.className = "msg"; msg.textContent = "Abrindo a prévia…";
-    var baixado;
-    return baixar().then(function (buf) {
-      baixado = true;
-      var b = new Uint8Array(buf), sal = b.slice(0, 16), iv = b.slice(16, 28), dados = b.slice(28);
-      return crypto.subtle.importKey("raw", new TextEncoder().encode(senha), "PBKDF2", false, ["deriveKey"]).then(function (k) {
-        return crypto.subtle.deriveKey({ name: "PBKDF2", salt: sal, iterations: VOLTAS, hash: "SHA-256" }, k,
-          { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
-      }).then(function (chave) { chaveAtual = chave; return crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, chave, dados); });
-    }).then(function (claro) {
+    var baixado = false;
+    return Promise.all([baixar().then(function (bufs) { baixado = true; return bufs; }), chaveDe(senha)]).then(function (r) {
+      chaveAtual = r[1];
+      return Promise.all(r[0].map(function (buf) { return decifra(buf, r[1]); }));
+    }).then(function (claros) {
+      var pacs = claros.map(abre);
+      return abreTextos(pacs[0]).then(function (abertos) { return [pacs, abertos]; });
+    }).then(function (x) {
       try { if (lembrar.checked) { localStorage.setItem(CHAVE, senha); } } catch (e) { /* navegador sem armazenamento */ }
-      var html = montar(claro);
+      var html = montar(x[0], x[1]);
       armaVideo();
       document.open(); document.write(html); document.close();
+      segunda(chaveAtual);
     }).catch(function () {
       botao.disabled = false; msg.className = "msg erro";
       if (!baixado) { msg.textContent = "Não foi possível baixar a prévia. Confira a internet e tente de novo."; return; }
